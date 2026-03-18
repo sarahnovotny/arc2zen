@@ -316,6 +316,121 @@ class Arc2ZenMigrator:
             logger.error("Migration failed")
             return False
 
+    def reset_zen_profile(self, zen_profile_name: Optional[str] = None) -> bool:
+        """Reset a Zen profile to clean state, removing all migration artifacts."""
+        import shutil
+        import re
+        from datetime import datetime
+
+        print("🔄 Arc to Zen — Profile Reset")
+        print("=" * 50)
+
+        # Check if Zen is running
+        running_browsers, any_running = self.check_browsers_running()
+        if 'Zen' in running_browsers:
+            print("❌ Zen browser is running. Please close it first.")
+            return False
+
+        # Find Zen profile
+        zen_analyzer = ZenSchemaAnalyzer()
+        zen_profiles = zen_analyzer.find_zen_profiles()
+        if not zen_profiles:
+            print("❌ No Zen profiles found!")
+            return False
+
+        selected_profile = None
+        if zen_profile_name:
+            for profile in zen_profiles:
+                if zen_profile_name in profile.name:
+                    selected_profile = profile
+                    break
+            if not selected_profile:
+                print(f"❌ Zen profile '{zen_profile_name}' not found!")
+                return False
+        else:
+            selected_profile = zen_profiles[0]
+
+        profile_path = selected_profile
+        print(f"Profile: {profile_path}")
+        print(f"\nThis will remove all migration artifacts and reset session files.")
+        print("A full backup of the profile will be created first.")
+
+        # Back up the profile
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = Path.home() / f"zen-profile-backup-{timestamp}"
+        print(f"\n💾 Backing up profile to {backup_dir} ...")
+        shutil.copytree(profile_path, backup_dir)
+        backup_size = sum(f.stat().st_size for f in backup_dir.rglob('*') if f.is_file())
+        print(f"  Done ({backup_size // 1024 // 1024}MB copied)")
+
+        # 1. Remove session files
+        print("\n🧹 Resetting session files...")
+        for pattern in [
+            "zen-sessions.jsonlz4", "zen-sessions.jsonlz4*.corrupt",
+            "zen-sessions-pre-import.jsonlz4",
+            "sessionstore.jsonlz4", "sessionstore-pre-import.jsonlz4",
+        ]:
+            for f in profile_path.glob(pattern):
+                f.unlink()
+        for d in ["zen-sessions-backup", "sessionstore-backups", "sessionstore-logs"]:
+            dirpath = profile_path / d
+            if dirpath.exists():
+                shutil.rmtree(dirpath)
+
+        # 2. Clean places.sqlite
+        print("🧹 Cleaning places.sqlite...")
+        import sqlite3
+        places_db = profile_path / "places.sqlite"
+        if places_db.exists():
+            with sqlite3.connect(places_db) as conn:
+                conn.execute("DELETE FROM zen_bookmarks_workspaces")
+                try:
+                    conn.execute("DELETE FROM zen_bookmarks_workspaces_changes")
+                except sqlite3.OperationalError:
+                    pass
+                # Remove non-default bookmarks (keep Firefox defaults id <= 11)
+                conn.execute("DELETE FROM moz_bookmarks WHERE id > 11")
+                conn.commit()
+
+        # 3. Reset containers.json — keep only defaults
+        print("🧹 Resetting containers.json...")
+        containers_file = profile_path / "containers.json"
+        if containers_file.exists():
+            import json
+            with open(containers_file) as f:
+                data = json.load(f)
+            data['identities'] = [
+                i for i in data.get('identities', [])
+                if i.get('userContextId', 0) <= 5
+                or i.get('userContextId', 0) == 4294967295
+            ]
+            with open(containers_file, 'w') as f:
+                json.dump(data, f, indent=2)
+
+        # 4. Remove workspace prefs from prefs.js
+        print("🧹 Cleaning workspace prefs...")
+        prefs_file = profile_path / "prefs.js"
+        if prefs_file.exists():
+            content = prefs_file.read_text(encoding='utf-8')
+            content = re.sub(
+                r'user_pref\("zen\.workspaces\.data",.*?\);\n?', '',
+                content, flags=re.DOTALL
+            )
+            content = re.sub(
+                r'user_pref\("zen\.workspaces\.active",.*?\);\n?', '',
+                content
+            )
+            prefs_file.write_text(content, encoding='utf-8')
+
+        # 5. Clean up guide file
+        guide = profile_path / "workspace_setup_guide.json"
+        if guide.exists():
+            guide.unlink()
+
+        print(f"\n✅ Zen profile reset. Backup at: {backup_dir}")
+        print("Open Zen — it will start fresh with a default workspace.")
+        return True
+
     def show_summary(self):
         """Show migration summary and recommendations."""
         print("\n📋 Post-Migration Notes:")
@@ -375,6 +490,12 @@ Examples:
         help='Enable verbose logging output'
     )
 
+    parser.add_argument(
+        '--reset',
+        action='store_true',
+        help='Reset Zen profile to clean state (removes all migration artifacts). Backs up the profile first.'
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -382,6 +503,18 @@ Examples:
 
     # Create migrator and run
     migrator = Arc2ZenMigrator()
+
+    if args.reset:
+        try:
+            success = migrator.reset_zen_profile(zen_profile_name=args.zen_profile)
+            sys.exit(0 if success else 1)
+        except KeyboardInterrupt:
+            print("\n\n⚠️ Reset cancelled by user")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+            logger.exception("Unexpected error during reset")
+            sys.exit(1)
 
     try:
         success = migrator.run_migration(

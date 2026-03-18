@@ -20,6 +20,9 @@ python3 migrate_arc_to_zen.py --arc-space "Work" --dry-run
 # Full migration (close both browsers first)
 python3 migrate_arc_to_zen.py
 
+# Reset Zen profile to clean state (backs up profile, removes migration artifacts)
+python3 migrate_arc_to_zen.py --reset
+
 # Test Arc data extraction standalone
 python3 src/arc_pinned_tab_extractor.py
 ```

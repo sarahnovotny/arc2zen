@@ -49,6 +49,9 @@ python3 migrate_arc_to_zen.py --min-visits 5 --zen-profile "Default" --verbose
 python3 migrate_arc_to_zen.py --arc-space "Personal"
 python3 migrate_arc_to_zen.py --arc-space "Work" --dry-run
 
+# Reset Zen profile to clean state (backs up first, then removes migration artifacts)
+python3 migrate_arc_to_zen.py --reset
+
 # See all available options
 python3 migrate_arc_to_zen.py --help
 ```
