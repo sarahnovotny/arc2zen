@@ -19,7 +19,10 @@ git clone https://github.com/rafcabezas/arc2zen.git
 cd arc2zen
 ```
 
-2. No additional dependencies required! Uses only Python standard library.
+2. Install the lz4 dependency (required for reading/writing Zen session files):
+```bash
+pip3 install lz4
+```
 
 ### Basic Usage
 

@@ -46,8 +46,14 @@ test_export.json
 workspace_uuid_mapping.json
 workspace_setup_guide.json
 sessionstore_backup_*.jsonlz4
+*-pre-import.jsonlz4
 places.sqlite.backup.*
 zen_database_backup_*.sqlite
+zen_places_pre_cleanup_backup.sqlite
+zen_containers_pre_cleanup_backup.json
+
+# Dev/debug utilities
+reset_zen.sh
 
 # Local configuration files
 .claude/settings.local.json

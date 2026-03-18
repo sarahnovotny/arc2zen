@@ -26,6 +26,7 @@ from zen_bookmark_importer import ZenBookmarkImporter
 from zen_space_importer import ZenSpaceImporter, ZenProfile
 from zen_pinned_tab_importer import ZenPinnedTabImporter
 from zen_workspace_importer import ZenWorkspaceImporter
+from zen_session_importer import ZenSessionImporter
 
 # Set up logging
 logging.basicConfig(
@@ -256,23 +257,42 @@ class Arc2ZenMigrator:
                 space_name = space['space_name']
                 container_mappings[space_name] = 1  # Default container
 
-        # Step 4b: Import as pinned tabs (actual pinned tabs, not bookmarks)
-        print("\n📌 Step 4b: Importing as pinned tabs...")
-        pinned_tab_importer = ZenPinnedTabImporter(selected_zen_profile)
-        workspace_mappings = pinned_tab_importer.import_arc_pinned_tabs(arc_export_data, container_mappings, dry_run=dry_run)
-        # For dry run, workspace_mappings is empty dict, but that's expected
-        pinned_success = workspace_mappings is not None  # Success if we got workspace mappings (even empty for dry run)
-
-        # Step 4c: Create actual Zen workspaces for each Arc space
-        print("\n🏗️  Step 4c: Creating actual Zen workspaces...")
+        # Step 4b: Create actual Zen workspaces FIRST so real UUIDs are
+        #          available before pinned tabs are written.
+        print("\n🏗️  Step 4b: Creating Zen workspaces...")
         workspace_importer = ZenWorkspaceImporter(selected_zen_profile)
-        workspace_success = workspace_importer.import_arc_workspaces(arc_export_data, container_mappings, workspace_mappings, dry_run=dry_run)
+        workspace_success = workspace_importer.import_arc_workspaces(
+            arc_export_data, container_mappings, workspace_mappings=None, dry_run=dry_run
+        )
 
-        # Step 4d: Import as bookmarks (for backup/organization)
-        print("\n📚 Step 4d: Importing as bookmarks...")
-        bookmark_success = zen_importer.import_arc_bookmarks(arc_export_data, dry_run=dry_run)
+        # Build space_name → workspace_uuid mapping from prefs.js so the
+        # pinned-tab importer can write directly to the correct workspace.
+        real_workspace_mappings: dict = {}
+        prefs_workspaces = workspace_importer.get_existing_workspaces()
+        # get_existing_workspaces returns {uuid: {name, ...}}
+        name_to_uuid = {info['name']: uid for uid, info in prefs_workspaces.items()}
+        for space in arc_export_data.get('spaces', []):
+            sname = space['space_name']
+            if sname in name_to_uuid:
+                real_workspace_mappings[sname] = name_to_uuid[sname]
 
-        success = space_success and pinned_success and workspace_success and bookmark_success
+        # Step 4c: Import pinned tabs into zen-sessions.jsonlz4
+        print("\n📌 Step 4c: Importing pinned tabs into session store...")
+        session_importer = ZenSessionImporter(selected_zen_profile)
+
+        # Build icon mapping from export data
+        workspace_icons: dict = {}
+        for space in arc_export_data.get('spaces', []):
+            if space.get('icon'):
+                workspace_icons[space['space_name']] = space['icon']
+
+        pinned_success = session_importer.import_pinned_tabs(
+            arc_export_data,
+            container_mappings,
+            real_workspace_mappings if real_workspace_mappings else {},
+            workspace_icons=workspace_icons,
+            dry_run=dry_run,
+        )
 
         # Cleanup
         if self.temp_export_file.exists():

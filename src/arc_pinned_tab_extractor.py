@@ -54,10 +54,12 @@ class ArcSpace:
     folders: List[ArcFolder]
     icon: Optional[str] = None  # Emoji icon from Arc space
     color: Optional[dict] = None  # RGB color from Arc space theme
+    session_tabs: Optional[List[ArcPinnedTab]] = None  # Unpinned/open session tabs
 
     def __str__(self):
         icon_str = f" ({self.icon})" if self.icon else ""
-        return f"ArcSpace(name='{self.space_name}'{icon_str}, tabs={len(self.pinned_tabs)}, folders={len(self.folders)})"
+        session_str = f", session={len(self.session_tabs)}" if self.session_tabs else ""
+        return f"ArcSpace(name='{self.space_name}'{icon_str}, tabs={len(self.pinned_tabs)}, folders={len(self.folders)}{session_str})"
 
 
 class ArcPinnedTabExtractor:
@@ -148,6 +150,51 @@ class ArcPinnedTabExtractor:
                 i += 2
             else:
                 i += 1
+
+        # Fallback: if spaceModels was empty (e.g. Firebase sync disabled),
+        # build spaces_info from sidebar.containers[1].spaces which always
+        # has the local space metadata including title.
+        if not spaces_info:
+            containers = data.get('sidebar', {}).get('containers', [])
+            if len(containers) > 1 and 'spaces' in containers[1]:
+                sidebar_spaces = containers[1]['spaces']
+                i = 0
+                while i < len(sidebar_spaces):
+                    if isinstance(sidebar_spaces[i], str) and i + 1 < len(sidebar_spaces):
+                        space_id = sidebar_spaces[i]
+                        space_data = sidebar_spaces[i + 1]
+                        space_name = space_data.get('title', f'Space {space_id}')
+
+                        icon = None
+                        custom_info = space_data.get('customInfo', {})
+                        if custom_info:
+                            icon_type = custom_info.get('iconType', {})
+                            if 'emoji_v2' in icon_type:
+                                icon = icon_type['emoji_v2']
+                                logger.info(f"  🎨 Found icon for {space_name}: {icon}")
+
+                        color = None
+                        window_theme = custom_info.get('windowTheme', {}) if custom_info else {}
+                        if window_theme:
+                            primary_palette = window_theme.get('primaryColorPalette', {})
+                            if primary_palette:
+                                mid_tone = primary_palette.get('midTone', {})
+                                if mid_tone and 'red' in mid_tone and 'green' in mid_tone and 'blue' in mid_tone:
+                                    r = max(0, min(1, mid_tone['red']))
+                                    g = max(0, min(1, mid_tone['green']))
+                                    b = max(0, min(1, mid_tone['blue']))
+                                    color = {'r': r, 'g': g, 'b': b}
+
+                        spaces_info[space_id] = {
+                            'name': space_name,
+                            'icon': icon,
+                            'profile': None,
+                            'color': color
+                        }
+                        i += 2
+                    else:
+                        i += 1
+                logger.info(f"Built spaces_info from sidebar data: {len(spaces_info)} spaces")
 
         # Get all items from local sidebar
         containers = data.get('sidebar', {}).get('containers', [])
@@ -316,10 +363,35 @@ class ArcPinnedTabExtractor:
                             pinned_tabs.sort(key=lambda tab: tab.index)
                             folders.sort(key=lambda folder: folder.index)
 
-                        if pinned_tabs or folders:
-                            logger.info(f"  ✅ {space_name}: {len(pinned_tabs)} pinned tabs, {len(folders)} folders")
+                        # Also extract unpinned/session tabs
+                        session_tabs = []
+                        unpinned_order = self._get_space_unpinned_order(space_id, items_lookup, data)
+                        if unpinned_order:
+                            sess_index = 0
+                            for item_id in unpinned_order:
+                                item_data = items_lookup.get(item_id, {})
+                                if not item_data:
+                                    continue
+                                data_section = item_data.get('data', {})
+                                if 'tab' in data_section:
+                                    tab_info = data_section['tab']
+                                    url = tab_info.get('savedURL', '')
+                                    title = item_data.get('title') or tab_info.get('savedTitle', 'Untitled')
+                                    if url:
+                                        session_tabs.append(ArcPinnedTab(
+                                            url=url, title=title,
+                                            space_id=space_id, space_name=space_name,
+                                            folder_path=[], tab_id=item_id,
+                                            parent_id=item_data.get('parentID', ''),
+                                            index=sess_index,
+                                        ))
+                                        sess_index += 1
+
+                        if pinned_tabs or folders or session_tabs:
+                            session_info = f", {len(session_tabs)} session tabs" if session_tabs else ""
+                            logger.info(f"  ✅ {space_name}: {len(pinned_tabs)} pinned tabs, {len(folders)} folders{session_info}")
                             space_color = space_info.get('color')
-                            arc_spaces.append(ArcSpace(space_id, space_name, pinned_tabs, folders, space_icon, space_color))
+                            arc_spaces.append(ArcSpace(space_id, space_name, pinned_tabs, folders, space_icon, space_color, session_tabs=session_tabs or None))
             else:
                 # Fallback to original method if sidebar spaces not found
                 for space_id, space_info in spaces_info.items():
@@ -677,8 +749,8 @@ class ArcPinnedTabExtractor:
                         container_data = items[i + 1]
                         children_ids = container_data.get('childrenIds', [])
                         if children_ids:
-                            # Categorize based on position relative to pinned/unpinned
-                            if idx > pinned_index:
+                            # Categorize: pinned if between 'pinned' and 'unpinned' labels
+                            if pinned_index < idx < unpinned_index:
                                 pinned_containers.append(children_ids)
                             elif idx > unpinned_index:
                                 unpinned_containers.append(children_ids)
@@ -703,6 +775,29 @@ class ArcPinnedTabExtractor:
                             combined.extend(children_ids)
                             break
                 return combined
+
+        return []
+
+    def _get_space_unpinned_order(self, space_id: str, items_lookup: Dict, data: Dict) -> List[str]:
+        """Get display order of unpinned (session) items in a space."""
+        space_container_ids = self._get_space_container_ids(space_id, data)
+        if not space_container_ids:
+            return []
+
+        try:
+            unpinned_index = space_container_ids.index('unpinned')
+        except ValueError:
+            return []
+
+        # The UUID container immediately after 'unpinned' has the session tabs
+        for idx in range(unpinned_index + 1, len(space_container_ids)):
+            container_id = space_container_ids[idx]
+            if container_id in ['pinned', 'unpinned']:
+                continue
+            container_data = items_lookup.get(container_id, {})
+            children_ids = container_data.get('childrenIds', [])
+            if children_ids:
+                return children_ids
 
         return []
 
@@ -894,7 +989,8 @@ class ArcPinnedTabExtractor:
                     'total_pinned_tabs': len(space.pinned_tabs),
                     'total_folders': len(space.folders),
                     'pinned_tabs': [tab.to_dict() for tab in space.pinned_tabs],
-                    'folders': [asdict(folder) for folder in space.folders]
+                    'folders': [asdict(folder) for folder in space.folders],
+                    'session_tabs': [tab.to_dict() for tab in (space.session_tabs or [])],
                 }
                 export_data['spaces'].append(space_data)
 

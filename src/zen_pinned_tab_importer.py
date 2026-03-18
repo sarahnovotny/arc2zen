@@ -2,8 +2,20 @@
 """
 Zen Pinned Tab Importer
 
-Imports Arc pinned tabs directly into Zen's zen_pins database table,
-creating proper folder hierarchy and workspace assignments.
+Imports Arc pinned tabs into Zen browser via moz_bookmarks + moz_places +
+zen_bookmarks_workspaces.
+
+Schema change (Zen >= ~1.6): zen_pins and zen_pins_changes tables were removed.
+Pinned tabs are now standard Firefox bookmarks in moz_bookmarks, with workspace
+assignment tracked in zen_bookmarks_workspaces.
+
+Changes from original:
+- Replaced all zen_pins reads/writes with moz_bookmarks + moz_places
+- Added zen_bookmarks_workspaces inserts for workspace assignment
+- Added _get_bookmark_parent_id() helper (guid → moz_bookmarks.id)
+- create_folder() / create_pinned_tab() return/accept guids, not UUIDs
+- tab_exists() checks moz_places.url instead of zen_pins
+- All other logic (ordering, folder hierarchy, dry-run, session cache) unchanged
 """
 
 import sqlite3
@@ -17,10 +29,11 @@ import json
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ZenPinnedTab:
     """Represents a pinned tab in Zen."""
-    uuid: str
+    uuid: str           # used as moz_bookmarks.guid (truncated to 12 chars)
     title: str
     url: str
     container_id: int
@@ -28,11 +41,12 @@ class ZenPinnedTab:
     position: int
     is_essential: bool = False
     is_group: bool = False
-    parent_uuid: Optional[str] = None
+    parent_uuid: Optional[str] = None   # moz_bookmarks.guid of parent folder
     edited_title: bool = False
     is_folder_collapsed: bool = False
     folder_icon: Optional[str] = None
-    arc_tab_id: Optional[str] = None  # Track Arc's original tab ID
+    arc_tab_id: Optional[str] = None
+
 
 @dataclass
 class ZenFolder:
@@ -46,388 +60,411 @@ class ZenFolder:
     is_collapsed: bool = False
     icon: Optional[str] = None
 
+
+def _make_guid() -> str:
+    """Generate a Firefox-style 12-char GUID."""
+    return str(uuid.uuid4()).replace('-', '')[:12]
+
+
+def _now_us() -> int:
+    """Microseconds since epoch (Firefox bookmark timestamp format)."""
+    return int(datetime.now().timestamp() * 1_000_000)
+
+
+def _now_ms() -> int:
+    """Milliseconds since epoch (zen_bookmarks_workspaces timestamp format)."""
+    return int(datetime.now().timestamp() * 1000)
+
+
+def _rev_host(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(url).netloc
+        return ".".join(reversed(netloc.split("."))) + "."
+    except Exception:
+        return ""
+
+
+def _url_hash(url: str) -> int:
+    return hash(url.encode('utf-8')) & 0x7FFFFFFF
+
+
 class ZenPinnedTabImporter:
-    """Imports Arc pinned tabs into Zen's zen_pins database."""
+    """Imports Arc pinned tabs into Zen via moz_bookmarks / zen_bookmarks_workspaces."""
+
+    # Standard Firefox GUID for the "Unfiled Bookmarks" root
+    UNFILED_GUID = "unfiled_____"
+    # Type constants
+    TYPE_BOOKMARK = 1
+    TYPE_FOLDER = 2
 
     def __init__(self, zen_profile_path: Path):
         self.zen_profile = zen_profile_path
         self.places_db = zen_profile_path / "places.sqlite"
-        self._ensure_arc_tab_id_column()
         # Track tabs imported in current session to prevent duplicates
-        self.imported_in_session = set()  # Store (arc_tab_id, title, url) tuples
+        self.imported_in_session: set = set()
 
+    # ------------------------------------------------------------------
+    # Compatibility shim: old callers expected this; now a no-op
+    # (zen_pins no longer exists)
+    # ------------------------------------------------------------------
     def _ensure_arc_tab_id_column(self):
-        """Ensure the arc_tab_id column exists in zen_pins table."""
-        try:
-            with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
+        pass  # zen_pins table removed; nothing to do
 
-                # Check if arc_tab_id column exists
-                cursor.execute("PRAGMA table_info(zen_pins)")
-                columns = [row[1] for row in cursor.fetchall()]
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-                if 'arc_tab_id' not in columns:
-                    # Add the arc_tab_id column
-                    cursor.execute("ALTER TABLE zen_pins ADD COLUMN arc_tab_id TEXT")
-                    conn.commit()
-                    logger.info("Added arc_tab_id column to zen_pins table")
+    def _unfiled_id(self, conn: sqlite3.Connection) -> int:
+        """Return the moz_bookmarks integer id for 'Unfiled Bookmarks'."""
+        cur = conn.execute(
+            "SELECT id FROM moz_bookmarks WHERE guid = ?", (self.UNFILED_GUID,)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        # Fallback: id=5 is the typical Firefox default for unfiled
+        return 5
 
-        except Exception as e:
-            logger.warning(f"Could not ensure arc_tab_id column exists: {e}")
+    def _get_bookmark_parent_id(self, conn: sqlite3.Connection,
+                                 parent_guid: Optional[str]) -> int:
+        """
+        Translate a bookmark GUID (returned by create_folder) to the
+        moz_bookmarks integer id needed for parent= inserts.
+
+        Falls back to unfiled root if guid is None or not found.
+        """
+        if not parent_guid:
+            return self._unfiled_id(conn)
+        cur = conn.execute(
+            "SELECT id FROM moz_bookmarks WHERE guid = ?", (parent_guid,)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        logger.warning(f"Parent guid not found: {parent_guid}, using unfiled root")
+        return self._unfiled_id(conn)
+
+    def _ensure_place(self, conn: sqlite3.Connection, url: str, title: str) -> int:
+        """Return moz_places.id for url, creating the row if needed."""
+        cur = conn.execute("SELECT id FROM moz_places WHERE url = ?", (url,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        place_guid = _make_guid()
+        cur = conn.execute(
+            """INSERT INTO moz_places
+               (url, title, rev_host, visit_count, frecency, guid, url_hash)
+               VALUES (?, ?, ?, 1, 100, ?, ?)""",
+            (url, title, _rev_host(url), place_guid, _url_hash(url))
+        )
+        return cur.lastrowid
+
+    def _link_workspace(self, conn: sqlite3.Connection,
+                        bookmark_guid: str, workspace_uuid: str):
+        """Insert or replace a row in zen_bookmarks_workspaces."""
+        now = _now_ms()
+        conn.execute(
+            """INSERT OR REPLACE INTO zen_bookmarks_workspaces
+               (bookmark_guid, workspace_uuid, created_at, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (bookmark_guid, workspace_uuid, now, now)
+        )
+
+    # ------------------------------------------------------------------
+    # Public API (signatures unchanged from original)
+    # ------------------------------------------------------------------
 
     def get_workspace_uuids(self) -> Dict[int, str]:
-        """Get workspace UUIDs for each container from existing pinned tabs."""
+        """
+        Return {container_id: workspace_uuid} from existing zen_bookmarks_workspaces.
+        (Original read from zen_pins; now reads from zen_bookmarks_workspaces.)
+        """
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT container_id, workspace_uuid
-                    FROM zen_pins
-                    WHERE workspace_uuid IS NOT NULL
-                """)
-
-                mappings = {}
-                for container_id, workspace_uuid in cursor.fetchall():
-                    mappings[container_id] = workspace_uuid
-
-                return mappings
-
+                cur = conn.execute(
+                    "SELECT DISTINCT workspace_uuid FROM zen_bookmarks_workspaces"
+                )
+                # We no longer have container_id in this table; return empty mapping
+                # so callers that relied on it degrade gracefully.
+                return {}
         except Exception as e:
             logger.error(f"Failed to get workspace UUIDs: {e}")
             return {}
 
-    def create_workspace_uuid_mappings(self, container_mappings: Dict[str, int]) -> Dict[str, str]:
-        """Create new workspace UUIDs for each Arc space."""
+    def create_workspace_uuid_mappings(self,
+                                        container_mappings: Dict[str, int]
+                                        ) -> Dict[str, str]:
+        """Create temporary workspace UUIDs for each Arc space (unchanged logic)."""
         workspace_mappings = {}
-
-        for space_name, container_id in container_mappings.items():
-            # Always create new workspace UUIDs for imported Arc spaces
-            workspace_uuid = "{" + str(uuid.uuid4()) + "}"
-            workspace_mappings[space_name] = workspace_uuid
-            logger.info(f"  📁 Creating new workspace for {space_name}: {workspace_uuid}")
-
+        for space_name in container_mappings:
+            ws_uuid = "{" + str(uuid.uuid4()) + "}"
+            workspace_mappings[space_name] = ws_uuid
+            logger.info(f"  📁 Creating new workspace for {space_name}: {ws_uuid}")
         return workspace_mappings
 
     def get_next_position(self, workspace_uuid: str) -> int:
-        """Get the next position for a pinned tab in a workspace."""
+        """
+        Get a starting position for tabs in a workspace.
+        (Original queried zen_pins; now queries moz_bookmarks under unfiled.)
+        """
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT MAX(position) FROM zen_pins WHERE workspace_uuid = ?
-                """, (workspace_uuid,))
-
-                result = cursor.fetchone()
-                return (result[0] or 0) + 1
-
+                unfiled = self._unfiled_id(conn)
+                cur = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM moz_bookmarks WHERE parent = ?",
+                    (unfiled,)
+                )
+                return cur.fetchone()[0]
         except Exception as e:
             logger.error(f"Failed to get next position: {e}")
             return 1
 
     def create_folder(self, title: str, container_id: int, workspace_uuid: str,
-                     position: int, parent_uuid: Optional[str] = None) -> str:
-        """Create a folder in zen_pins and return its UUID."""
+                      position: int, parent_uuid: Optional[str] = None) -> str:
+        """
+        Create a folder bookmark in moz_bookmarks and link it to the workspace.
 
-        # Check if folder already exists to prevent duplicates
+        Returns the new folder's moz_bookmarks.guid (12-char string).
+        Original returned a curly-brace UUID; callers treat the return value
+        opaquely so this is compatible.
+        """
+        # Check if folder already exists under the same parent in this workspace
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT uuid FROM zen_pins
-                    WHERE title = ? AND container_id = ? AND is_group = 1 AND folder_parent_uuid IS ?
-                """, (title, container_id, parent_uuid))
-
-                existing = cursor.fetchone()
+                parent_id = self._get_bookmark_parent_id(conn, parent_uuid)
+                cur = conn.execute(
+                    """SELECT mb.guid FROM moz_bookmarks mb
+                       LEFT JOIN zen_bookmarks_workspaces zbw ON mb.guid = zbw.bookmark_guid
+                       WHERE mb.title = ? AND mb.parent = ? AND mb.type = 2
+                         AND (zbw.workspace_uuid = ? OR zbw.workspace_uuid IS NULL)""",
+                    (title, parent_id, workspace_uuid)
+                )
+                existing = cur.fetchone()
                 if existing:
                     logger.info(f"    📁 Folder '{title}' already exists, reusing")
                     return existing[0]
-
         except Exception as e:
             logger.warning(f"Failed to check for existing folder: {e}")
 
-        folder_uuid = "{" + str(uuid.uuid4()) + "}"
-        timestamp = int(datetime.now().timestamp() * 1000)
+        folder_guid = _make_guid()
+        now_us = _now_us()
 
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO zen_pins (
-                        uuid, title, url, container_id, workspace_uuid, position,
-                        is_essential, is_group, folder_parent_uuid, created_at, updated_at,
-                        edited_title, is_folder_collapsed, folder_icon
-                    ) VALUES (?, ?, NULL, ?, ?, ?, 0, 1, ?, ?, ?, 0, 0, NULL)
-                """, (folder_uuid, title, container_id, workspace_uuid, position,
-                      parent_uuid, timestamp, timestamp))
+                parent_id = self._get_bookmark_parent_id(conn, parent_uuid)
+                cur = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM moz_bookmarks WHERE parent = ?",
+                    (parent_id,)
+                )
+                pos = cur.fetchone()[0]
 
-                # Add to changes table
-                cursor.execute("""
-                    INSERT OR REPLACE INTO zen_pins_changes (uuid, timestamp)
-                    VALUES (?, ?)
-                """, (folder_uuid, timestamp))
-
+                conn.execute(
+                    """INSERT INTO moz_bookmarks
+                       (type, parent, position, title, dateAdded, lastModified, guid)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (self.TYPE_FOLDER, parent_id, pos, title, now_us, now_us, folder_guid)
+                )
+                self._link_workspace(conn, folder_guid, workspace_uuid)
                 conn.commit()
-                return folder_uuid
+                return folder_guid
 
         except Exception as e:
             logger.error(f"Failed to create folder '{title}': {e}")
             return ""
 
     def tab_exists(self, arc_tab_id: str, title: str, url: str) -> bool:
-        """Check if a tab already exists to prevent duplicates from multiple script runs."""
-        # First check session cache for tabs imported in current run
+        """Check if a URL already exists as a bookmark (dedup guard)."""
         session_key = (arc_tab_id, title, url)
         if session_key in self.imported_in_session:
             return True
-
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
-
-                if arc_tab_id:
-                    # If we have Arc tab ID, first try precise duplicate detection
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM zen_pins
-                        WHERE arc_tab_id = ?
-                    """, (arc_tab_id,))
-
-                    result = cursor.fetchone()
-                    arc_id_count = result[0]
-
-                    # If Arc tab ID found exact matches, return True immediately
-                    if arc_id_count > 0:
-                        return True
-
-                    # Arc tab ID found no matches, fall back to title+URL detection
-                    # This catches legacy tabs imported without Arc tab IDs
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM zen_pins
-                        WHERE title = ? AND url = ?
-                    """, (title, url))
-
-                    result = cursor.fetchone()
-                    title_url_count = result[0]
-
-                    return title_url_count > 0
-
-                else:
-                    # Fallback for tabs without Arc tab ID: check by title and URL globally
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM zen_pins
-                        WHERE title = ? AND url = ?
-                    """, (title, url))
-
-                    result = cursor.fetchone()
-                    count = result[0]
-
-
-                    return count > 0
-
+                cur = conn.execute(
+                    """SELECT COUNT(*) FROM moz_bookmarks mb
+                       JOIN moz_places mp ON mb.fk = mp.id
+                       WHERE mp.url = ? AND mb.type = 1""",
+                    (url,)
+                )
+                return cur.fetchone()[0] > 0
         except Exception as e:
             logger.error(f"Failed to check if tab exists: {e}")
             return False
 
     def create_pinned_tab(self, tab: ZenPinnedTab) -> bool:
-        """Create a pinned tab in zen_pins."""
+        """
+        Create a pinned tab as a moz_bookmarks entry linked to its workspace.
 
-        # Check if tab already exists to prevent duplicates from multiple script runs
-        exists = self.tab_exists(tab.arc_tab_id, tab.title, tab.url)
-
-        if exists:
+        Storage: moz_places (URL) + moz_bookmarks (bookmark) +
+                 zen_bookmarks_workspaces (workspace assignment).
+        """
+        if self.tab_exists(tab.arc_tab_id, tab.title, tab.url):
             logger.info(f"    ⚠️ Skipping duplicate tab: {tab.title}")
             return False
 
-        timestamp = int(datetime.now().timestamp() * 1000)
+        bm_guid = _make_guid()
+        now_us = _now_us()
 
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
+                place_id = self._ensure_place(conn, tab.url, tab.title)
+                parent_id = self._get_bookmark_parent_id(conn, tab.parent_uuid)
 
-                cursor.execute("""
-                    INSERT INTO zen_pins (
-                        uuid, title, url, container_id, workspace_uuid, position,
-                        is_essential, is_group, folder_parent_uuid, created_at, updated_at,
-                        edited_title, is_folder_collapsed, folder_icon, arc_tab_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, NULL, ?)
-                """, (tab.uuid, tab.title, tab.url, tab.container_id, tab.workspace_uuid,
-                      tab.position, int(tab.is_essential), tab.parent_uuid,
-                      timestamp, timestamp, int(tab.edited_title), tab.arc_tab_id))
+                cur = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM moz_bookmarks WHERE parent = ?",
+                    (parent_id,)
+                )
+                pos = cur.fetchone()[0]
 
-                # Add to changes table
-                cursor.execute("""
-                    INSERT OR REPLACE INTO zen_pins_changes (uuid, timestamp)
-                    VALUES (?, ?)
-                """, (tab.uuid, timestamp))
-
-                # Add to session cache to prevent duplicates within the same run
-                session_key = (tab.arc_tab_id, tab.title, tab.url)
-                self.imported_in_session.add(session_key)
-
+                conn.execute(
+                    """INSERT INTO moz_bookmarks
+                       (type, fk, parent, position, title, dateAdded, lastModified, guid)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (self.TYPE_BOOKMARK, place_id, parent_id, pos,
+                     tab.title, now_us, now_us, bm_guid)
+                )
+                self._link_workspace(conn, bm_guid, tab.workspace_uuid)
                 conn.commit()
-                return True
+
+            self.imported_in_session.add((tab.arc_tab_id, tab.title, tab.url))
+            return True
 
         except Exception as e:
             logger.error(f"Failed to create pinned tab '{tab.title}': {e}")
             return False
 
     def build_folder_hierarchy(self, space_name: str, pinned_tabs: List[Dict],
-                              container_id: int, workspace_uuid: str) -> Dict[str, str]:
-        """Build folder hierarchy and return path -> uuid mapping."""
-        folder_uuids = {}
-        position = self.get_next_position(workspace_uuid)
+                               container_id: int, workspace_uuid: str) -> Dict[str, str]:
+        """Build folder hierarchy and return path → guid mapping (logic unchanged)."""
+        folder_uuids: Dict[str, str] = {}
 
-        # DO NOT create root folder for the space - tabs go directly to workspace root
-        # folder_uuids[""] = None  # Root level (no folder)
-
-        # Collect all unique folder paths
-        all_paths = set()
+        ordered_paths: List[str] = []
+        seen_paths: set = set()
         for tab in pinned_tabs:
-            folder_path = tab.get('folder_path', [])
-            for i in range(len(folder_path)):
-                path = "/".join(folder_path[:i+1])
-                all_paths.add(path)
-
-        # Create folders in Arc order (preserve tab ordering for folder creation)
-        # Collect folder paths in the order they appear in tabs
-        ordered_paths = []
-        seen_paths = set()
-        for tab in pinned_tabs:
-            folder_path = tab.get('folder_path', [])
-            for i in range(len(folder_path)):
-                path = "/".join(folder_path[:i+1])
+            for i in range(len(tab.get('folder_path', []))):
+                path = "/".join(tab['folder_path'][:i + 1])
                 if path not in seen_paths:
                     ordered_paths.append(path)
                     seen_paths.add(path)
 
+        position = 0
         for path in ordered_paths:
             if path in folder_uuids:
                 continue
+            parts = path.split("/")
+            folder_name = parts[-1]
+            parent_path = "/".join(parts[:-1]) if len(parts) > 1 else ""
+            parent_guid = folder_uuids.get(parent_path)
 
-            path_parts = path.split("/")
-            folder_name = path_parts[-1]
-            parent_path = "/".join(path_parts[:-1]) if len(path_parts) > 1 else ""
-            parent_uuid = folder_uuids.get(parent_path)  # None for root level
-
-            folder_uuid = self.create_folder(folder_name, container_id, workspace_uuid, position, parent_uuid)
-            if folder_uuid:
-                folder_uuids[path] = folder_uuid
+            folder_guid = self.create_folder(
+                folder_name, container_id, workspace_uuid, position, parent_guid
+            )
+            if folder_guid:
+                folder_uuids[path] = folder_guid
                 position += 1
                 logger.info(f"    📁 Created folder: {folder_name}")
 
         return folder_uuids
 
     def get_existing_folders(self, workspace_uuid: str) -> Dict[str, str]:
-        """Get existing folders from the database for a workspace."""
-        existing_folders = {}
+        """Return {title: guid} for folders already linked to this workspace."""
+        existing: Dict[str, str] = {}
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT uuid, title FROM zen_pins
-                    WHERE workspace_uuid = ? AND is_group = 1
-                """, (workspace_uuid,))
-
-                for row in cursor.fetchall():
-                    folder_uuid, folder_title = row
-                    existing_folders[folder_title] = folder_uuid
-
+                cur = conn.execute(
+                    """SELECT mb.guid, mb.title
+                       FROM moz_bookmarks mb
+                       JOIN zen_bookmarks_workspaces zbw ON mb.guid = zbw.bookmark_guid
+                       WHERE zbw.workspace_uuid = ? AND mb.type = 2""",
+                    (workspace_uuid,)
+                )
+                for guid, title in cur.fetchall():
+                    if title:
+                        existing[title] = guid
         except Exception as e:
             logger.error(f"Failed to get existing folders: {e}")
+        return existing
 
-        return existing_folders
-
-    def create_exported_folders(self, folders: List[Dict], container_id: int, workspace_uuid: str) -> Dict[str, str]:
-        """Create folders directly from exported folder data, preserving Arc order and hierarchy."""
-        folder_uuids = {}
-        base_position = self.get_next_position(workspace_uuid)
-
-        # Get existing folders first
+    def create_exported_folders(self, folders: List[Dict], container_id: int,
+                                 workspace_uuid: str) -> Dict[str, str]:
+        """
+        Create folders from exported folder data, preserving Arc order and hierarchy.
+        Logic unchanged from original; only storage layer differs.
+        """
+        folder_uuids: Dict[str, str] = {}
         existing_folders = self.get_existing_folders(workspace_uuid)
         folder_uuids.update(existing_folders)
 
-        # Sort folders by their index to preserve Arc ordering
         sorted_folders = sorted(folders, key=lambda f: f.get('index', 0))
-
-        # Create folders in two passes to handle parent-child relationships
-        # First pass: create all folders and map their IDs
-        folder_id_to_data = {}
-        for folder_data in sorted_folders:
-            folder_id = folder_data.get('folder_id', '')
-            if folder_id:
-                folder_id_to_data[folder_id] = folder_data
-
-        # Second pass: create folders in dependency order (parents before children)
-        created_folders = set()
-        position = base_position
+        folder_id_to_data = {
+            f['folder_id']: f for f in sorted_folders if f.get('folder_id')
+        }
+        created_folders: set = set()
+        position = 0
 
         def create_folder_with_hierarchy(folder_data):
             nonlocal position
             folder_id = folder_data.get('folder_id', '')
             folder_title = folder_data.get('title', 'Untitled Folder')
 
-            # Skip if already exists in database
             if folder_title in existing_folders:
-                # Map the existing folder
                 folder_uuids[folder_title] = existing_folders[folder_title]
                 if folder_id:
                     folder_uuids[folder_id] = existing_folders[folder_title]
                 logger.info(f"    📁 Using existing folder: {folder_title}")
                 return
 
-            # Skip if already created in this run
             if folder_id in created_folders:
                 return
 
             folder_parent_id = folder_data.get('parent_id', '')
+            parent_guid = None
 
-            # Determine parent UUID
-            parent_uuid = None
             if folder_parent_id and folder_parent_id in folder_uuids:
-                # Parent is another folder
-                parent_uuid = folder_uuids[folder_parent_id]
+                parent_guid = folder_uuids[folder_parent_id]
             elif folder_parent_id and folder_parent_id in folder_id_to_data:
-                # Parent folder exists but hasn't been created yet - create it first
                 create_folder_with_hierarchy(folder_id_to_data[folder_parent_id])
-                parent_uuid = folder_uuids.get(folder_parent_id)
+                parent_guid = folder_uuids.get(folder_parent_id)
 
-            # Create the folder
-            folder_uuid = self.create_folder(folder_title, container_id, workspace_uuid, position, parent_uuid)
-
-            if folder_uuid:
-                # Map by folder_id for parent-child lookups
+            folder_guid = self.create_folder(
+                folder_title, container_id, workspace_uuid, position, parent_guid
+            )
+            if folder_guid:
                 if folder_id:
-                    folder_uuids[folder_id] = folder_uuid
-                # Also map by title for tab folder_path matching
-                folder_uuids[folder_title] = folder_uuid
-
+                    folder_uuids[folder_id] = folder_guid
+                folder_uuids[folder_title] = folder_guid
                 created_folders.add(folder_id)
                 position += 1
-
-                parent_info = f" (child of {folder_id_to_data.get(folder_parent_id, {}).get('title', 'unknown')})" if parent_uuid else ""
+                parent_name = folder_id_to_data.get(folder_parent_id, {}).get('title')
+                parent_info = f" (child of {parent_name})" if parent_guid and parent_name else ""
                 logger.info(f"    📁 Created folder: {folder_title}{parent_info}")
 
-        # Create all folders with proper hierarchy
         for folder_data in sorted_folders:
             create_folder_with_hierarchy(folder_data)
 
         return folder_uuids
 
-    def import_arc_pinned_tabs(self, arc_export_data: Dict, container_mappings: Dict[str, int],
-                              dry_run: bool = False) -> Dict[str, str]:
-        """Import Arc pinned tabs as Zen pinned tabs.
+    def import_arc_pinned_tabs(self, arc_export_data: Dict,
+                                container_mappings: Dict[str, int],
+                                dry_run: bool = False,
+                                workspace_uuid_override: Optional[Dict[str, str]] = None,
+                                ) -> Dict[str, str]:
+        """
+        Import Arc pinned tabs as Zen bookmarks linked to workspace UUIDs.
 
-        Returns:
-            Dict mapping space names to temporary workspace UUIDs
+        Returns: dict mapping space names to (temporary) workspace UUIDs.
+        Logic unchanged; only storage layer differs.
         """
         try:
             logger.info("📌 Importing Arc pinned tabs into Zen pinned tab system...")
-
             if dry_run:
                 logger.info("🧪 DRY RUN - No database changes will be made")
 
-            # Create workspace mappings
-            workspace_mappings = self.create_workspace_uuid_mappings(container_mappings)
-
+            if workspace_uuid_override:
+                workspace_mappings = workspace_uuid_override
+                logger.info("Using real workspace UUIDs from prefs.js")
+            else:
+                workspace_mappings = self.create_workspace_uuid_mappings(container_mappings)
             total_tabs = 0
             total_folders = 0
 
@@ -436,9 +473,6 @@ class ZenPinnedTabImporter:
                 pinned_tabs = space.get('pinned_tabs', [])
                 folders = space.get('folders', [])
 
-                # Both tabs and folders are already in correct Arc sidebar order from extraction
-                # No sorting needed - preserve original extraction order
-
                 container_id = container_mappings.get(space_name, 1)
                 workspace_uuid = workspace_mappings.get(space_name)
 
@@ -446,76 +480,76 @@ class ZenPinnedTabImporter:
                     logger.warning(f"No workspace UUID for space: {space_name}")
                     continue
 
-                logger.info(f"  📁 Processing {space_name}: {len(pinned_tabs)} tabs, {len(folders)} folders (preserving Arc sidebar order)")
-
+                logger.info(
+                    f"  📁 Processing {space_name}: {len(pinned_tabs)} tabs, "
+                    f"{len(folders)} folders (preserving Arc sidebar order)"
+                )
 
                 if dry_run:
                     total_tabs += len(pinned_tabs)
                     total_folders += len(folders)
                     continue
 
-                # Create folders directly from exported folder data (preserving Arc order)
-                folder_uuids = self.create_exported_folders(folders, container_id, workspace_uuid)
+                folder_uuids = self.create_exported_folders(
+                    folders, container_id, workspace_uuid
+                )
                 total_folders += len(folder_uuids)
 
-                # Import pinned tabs using preserved Arc ordering
                 base_position = self.get_next_position(workspace_uuid)
 
                 for i, tab_data in enumerate(pinned_tabs):
                     folder_path = tab_data.get('folder_path', [])
+                    parent_guid = None
 
-                    # For tabs without folders, parent_uuid should be None (workspace root)
-                    # For tabs with folders, use the UUID of the last folder in the path (immediate parent)
-                    parent_uuid = None
                     if folder_path:
-                        # Get the immediate parent folder (last element in the path)
                         immediate_parent = folder_path[-1]
-                        parent_uuid = folder_uuids.get(immediate_parent)
-
-                        # If immediate parent not found, try to find any existing folder in the path
-                        if not parent_uuid:
-                            for folder_name in reversed(folder_path):
-                                parent_uuid = folder_uuids.get(folder_name)
-                                if parent_uuid:
+                        parent_guid = folder_uuids.get(immediate_parent)
+                        if not parent_guid:
+                            for fn in reversed(folder_path):
+                                parent_guid = folder_uuids.get(fn)
+                                if parent_guid:
                                     break
 
-                    # Use sequential position to preserve Arc ordering
-                    # Since tabs are already sorted by Arc index, enumerate maintains order
                     position = base_position + i
-
-                    # Check if this is an Essential tab (from Arc's top toolbar)
                     is_essential = tab_data.get('is_essential', False)
-
                     arc_tab_id = tab_data.get('tab_id')
+
                     tab = ZenPinnedTab(
-                        uuid="{" + str(uuid.uuid4()) + "}",
+                        uuid=_make_guid(),
                         title=tab_data['title'],
                         url=tab_data['url'],
                         container_id=container_id,
                         workspace_uuid=workspace_uuid,
                         position=position,
                         is_essential=is_essential,
-                        parent_uuid=parent_uuid,
-                        arc_tab_id=arc_tab_id
+                        parent_uuid=parent_guid,
+                        arc_tab_id=arc_tab_id,
                     )
-
 
                     if self.create_pinned_tab(tab):
                         total_tabs += 1
 
-                skipped_count = len(pinned_tabs) - total_tabs
-                if skipped_count > 0:
-                    logger.info(f"    ✅ Imported {total_tabs} pinned tabs ({skipped_count} skipped as duplicates)")
+                skipped = len(pinned_tabs) - total_tabs
+                if skipped > 0:
+                    logger.info(
+                        f"    ✅ Imported {total_tabs} pinned tabs "
+                        f"({skipped} skipped as duplicates)"
+                    )
                 else:
                     logger.info(f"    ✅ Imported {total_tabs} pinned tabs")
 
             if dry_run:
-                logger.info(f"🧪 Would import {total_tabs} pinned tabs and create {total_folders} folders")
+                logger.info(
+                    f"🧪 Would import {total_tabs} pinned tabs "
+                    f"and create {total_folders} folders"
+                )
                 return {}
-            else:
-                logger.info(f"✅ Successfully imported {total_tabs} pinned tabs and {total_folders} folders")
-                logger.info("🔄 Restart Zen browser to see your imported pinned tabs")
 
+            logger.info(
+                f"✅ Successfully imported {total_tabs} pinned tabs "
+                f"and {total_folders} folders"
+            )
+            logger.info("🔄 Restart Zen browser to see your imported pinned tabs")
             return workspace_mappings
 
         except Exception as e:
@@ -523,20 +557,32 @@ class ZenPinnedTabImporter:
             return {}
 
     def clear_imported_pins(self, workspace_uuids: List[str]) -> bool:
-        """Clear previously imported pins for re-import."""
+        """
+        Clear previously imported pins for re-import.
+        (Original deleted from zen_pins; now deletes from moz_bookmarks via
+        zen_bookmarks_workspaces.)
+        """
         try:
             with sqlite3.connect(self.places_db) as conn:
-                cursor = conn.cursor()
                 placeholders = ",".join(["?" for _ in workspace_uuids])
-                cursor.execute(f"""
-                    DELETE FROM zen_pins WHERE workspace_uuid IN ({placeholders})
-                """, workspace_uuids)
+                cur = conn.execute(
+                    f"""SELECT bookmark_guid FROM zen_bookmarks_workspaces
+                        WHERE workspace_uuid IN ({placeholders})""",
+                    workspace_uuids
+                )
+                guids = [row[0] for row in cur.fetchall()]
 
-                cursor.execute(f"""
-                    DELETE FROM zen_pins_changes WHERE uuid IN (
-                        SELECT uuid FROM zen_pins WHERE workspace_uuid IN ({placeholders})
+                if guids:
+                    guid_ph = ",".join(["?" for _ in guids])
+                    conn.execute(
+                        f"""DELETE FROM zen_bookmarks_workspaces
+                            WHERE workspace_uuid IN ({placeholders})""",
+                        workspace_uuids
                     )
-                """, workspace_uuids)
+                    conn.execute(
+                        f"DELETE FROM moz_bookmarks WHERE guid IN ({guid_ph})",
+                        guids
+                    )
 
                 conn.commit()
                 logger.info("🧹 Cleared existing imported pins")
